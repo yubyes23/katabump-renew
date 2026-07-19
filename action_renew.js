@@ -160,10 +160,7 @@ async function launchChrome() {
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--user-data-dir=/tmp/chrome_user_data',
-        '--disable-dev-shm-usage',
-        '--disable-blink-features=AutomationControlled',
-        '--lang=en-US',
-        '--accept-lang=en-US,en'
+        '--disable-dev-shm-usage'
     ];
     if (PROXY_CONFIG) {
         args.push(`--proxy-server=${PROXY_CONFIG.server}`);
@@ -196,607 +193,51 @@ function getUsers() {
     return [];
 }
 
-// --- 找到 Cloudflare Turnstile challenge frames（每次调用都重新扫描 page.frames，不缓存旧 frame） ---
-function findChallengeFrames(page) {
-    return page.frames().filter((f) => {
-        try {
-            const u = f.url() || '';
-            return /challenges\.cloudflare\.com|turnstile/i.test(u);
-        } catch (e) {
-            return false;
-        }
-    });
-}
-
-// --- 校验 box 是否真实可点：非 null、非 1x1、在视口内、有足够尺寸 ---
-function isValidClickBox(box, viewport) {
-    if (!box) return false;
-    if (!(box.width >= 20 && box.height >= 15)) return false;
-    // 排除 1x1 / 极小
-    if (box.width <= 5 || box.height <= 5) return false;
-    // 在视口内（允许少量溢出）
-    if (viewport) {
-        if (box.x + box.width < 0 || box.y + box.height < 0) return false;
-        if (box.x > viewport.width || box.y > viewport.height) return false;
-    }
-    return true;
-}
-
-// --- 获取 challenge frame 的页面坐标 bounding box ---
-// 必须：await frame.frameElement() → boundingBox()；frame 本身没有页面坐标
-// 每次调用重新 findChallengeFrames，不复用旧 frame
-async function getChallengeFrameBox(page) {
-    const frames = findChallengeFrames(page); // 每次刷新后必须重新获取
-    console.log(`[登录阶段] challenge frame 扫描: 找到 ${frames.length} 个`);
-
-    let viewport = null;
-    try {
-        viewport = page.viewportSize() || await page.evaluate(() => ({
-            width: window.innerWidth,
-            height: window.innerHeight
-        }));
-    } catch (e) {
-        viewport = { width: 1280, height: 720 };
-    }
-
+// --- 核心过盾函数（Turnstile CDP 点击） ---
+async function attemptTurnstileCdp(page) {
+    const frames = page.frames();
     for (const frame of frames) {
         try {
-            const el = await frame.frameElement(); // 关键：通过 frameElement 取页面坐标
-            if (!el) continue;
-            const box = await el.boundingBox();
-            if (isValidClickBox(box, viewport)) {
-                console.log(`[登录阶段] challenge frame 已找到 url=${(frame.url() || '').substring(0, 90)}`);
-                return { frame, box, url: frame.url(), source: 'frameElement' };
-            }
-            if (box) {
-                console.log(`[登录阶段] challenge frame box 无效: w=${box.width} h=${box.height} x=${box.x} y=${box.y}`);
-            }
-        } catch (e) {
-            console.log(`[登录阶段] frame.frameElement/boundingBox 失败: ${e.message}`);
-        }
-    }
-
-    // fallback: .cf-turnstile 容器（仅当 frame box 不可用时）
-    try {
-        const widget = page.locator('.cf-turnstile, [data-sitekey], #cf-turnstile').first();
-        if (await widget.isVisible({ timeout: 1000 }).catch(() => false)) {
-            const box = await widget.boundingBox();
-            if (isValidClickBox(box, viewport)) {
-                console.log('[登录阶段] 使用 .cf-turnstile 容器 box 作为点击目标');
-                return {
-                    frame: frames[0] || null,
-                    box,
-                    url: frames[0] ? frames[0].url() : 'widget-container',
-                    source: 'widget-container'
-                };
-            }
-        }
-    } catch (e) { }
-
-    console.log('[登录阶段] challenge box 未取到有效目标（null / 1x1 / 超出视口）');
-    return null;
-}
-
-// --- CDP 在指定坐标点击；成功返回 true ---
-async function cdpClickAt(page, x, y, label = '') {
-    console.log(`>> CDP 点击 ${label} 坐标=(${x.toFixed(1)}, ${y.toFixed(1)})`);
-    const client = await page.context().newCDPSession(page);
-    try {
-        await client.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
-        await new Promise(r => setTimeout(r, 60 + Math.random() * 100));
-        await client.send('Input.dispatchMouseEvent', {
-            type: 'mousePressed', x, y, button: 'left', clickCount: 1
-        });
-        await new Promise(r => setTimeout(r, 40 + Math.random() * 80));
-        await client.send('Input.dispatchMouseEvent', {
-            type: 'mouseReleased', x, y, button: 'left', clickCount: 1
-        });
-        return true;
-    } catch (e) {
-        console.log(`>> CDP 点击失败 ${label}: ${e.message}`);
-        return false;
-    } finally {
-        await client.detach().catch(() => { });
-    }
-}
-
-// --- 单次点击 challenge checkbox（一轮只点一次，不轮询多点/多策略） ---
-// 返回 { sent: boolean, x, y, urlBefore }
-async function attemptTurnstileSingleClick(page) {
-    const target = await getChallengeFrameBox(page);
-    if (!target || !target.box) {
-        console.log('[登录阶段] challenge frame box 未找到，无法点击');
-        return { sent: false, x: null, y: null, urlBefore: null };
-    }
-    const { box, url } = target;
-    // 固定左侧 checkbox 区域（已验证过的点）
-    const x = box.x + 28;
-    const y = box.y + box.height / 2;
-    console.log(`[登录阶段] challenge frame 已找到`);
-    console.log(`[登录阶段] challenge box: x=${box.x.toFixed(1)} y=${box.y.toFixed(1)} w=${box.width.toFixed(1)} h=${box.height.toFixed(1)}`);
-    console.log(`[登录阶段] 本轮只点击一次 checkbox: (${x.toFixed(1)}, ${y.toFixed(1)}) url=${(url || '').substring(0, 90)}`);
-
-    try {
-        await page.mouse.move(x - 25, y - 12, { steps: 6 });
-        await page.waitForTimeout(100 + Math.random() * 100);
-        const ok = await cdpClickAt(page, x, y, 'checkbox-left-28');
-        console.log(`[登录阶段] 点击事件实际发送=${ok}`);
-        return { sent: ok, x, y, urlBefore: url || '' };
-    } catch (e) {
-        console.log(`[登录阶段] 单次点击失败: ${e.message}`);
-        return { sent: false, x, y, urlBefore: url || '' };
-    }
-}
-
-// --- 兼容旧名：Renew 阶段仍可能调用 ---
-async function attemptTurnstileChallengeFrameClick(page) {
-    const r = await attemptTurnstileSingleClick(page);
-    return { sent: !!r.sent };
-}
-async function attemptTurnstileCdp(page) {
-    const r = await attemptTurnstileSingleClick(page);
-    return { sent: !!r.sent };
-}
-async function attemptTurnstilePlaywrightMouse(page) {
-    // 停用多策略，避免干扰；返回未发送
-    console.log('[登录阶段] PlaywrightMouse 已停用（一轮只允许一次 ChallengeFrameCDP 点击）');
-    return { sent: false };
-}
-async function attemptTurnstileIframeClick(page) {
-    console.log('[登录阶段] IframeClick 已停用（一轮只允许一次 ChallengeFrameCDP 点击）');
-    return { sent: false };
-}
-
-// --- 点击后独立等待 + 诊断 ---
-// 状态切换：click_sent → [click_no_effect | challenge_progress_no_token | turnstile_verification_failed | turnstile_token_ready]
-// 检测到 progress 后自动延长等待窗口
-// 每次轮询重新查询 DOM（不缓存旧 ElementHandle），记录字段数量、name、value length
-// frame 消失时立即检查父页面状态
-async function waitAfterTurnstileClick(page, urlBefore, initialTimeoutMs = 15000, progressExtraMs = 12000) {
-    const overallStart = Date.now();
-    let sawProgress = false;
-    let lastFrameUrl = urlBefore || '';
-    let progressAt = 0;
-    const maxTotal = initialTimeoutMs + progressExtraMs;
-    console.log(`[登录阶段] state=click_sent，进入 challenge 处理等待 (初始观察 ${initialTimeoutMs}ms，检测到 progress 额外 ${progressExtraMs}ms)...`);
-
-    // 记录网络错误和 frame 生命周期
-    let pageErrors = [];
-    let consoleErrors = [];
-    const errorHandler = (msg) => { if (msg.type() === 'error' || msg.type() === 'warning') consoleErrors.push(msg.text()); };
-    const pageErrorHandler = (err) => { pageErrors.push(err.message); };
-    try {
-        page.on('pageerror', pageErrorHandler);
-        page.on('console', errorHandler);
-    } catch (e) {}
-
-    try {
-        while (Date.now() - overallStart < maxTotal) {
-            // 超时判断：15s 内无 progress 则退出；有 progress 则允许最多再等 12s
-            const elapsedSinceProgress = sawProgress ? (Date.now() - progressAt) : (Date.now() - overallStart - initialTimeoutMs);
-            if ((!sawProgress && Date.now() - overallStart > initialTimeoutMs)
-                || (sawProgress && elapsedSinceProgress > progressExtraMs)) {
-                const reason = sawProgress ? 'progress 后额外等待超时' : '初始等待超时无 progress';
-                console.log(`[登录阶段] 等待结束 reason=${reason} sawProgress=${sawProgress}`);
-                break;
-            }
-
-            // 每次轮询重新 getTurnstileTokenInfo（不缓存旧字段引用）
-            const info = await getTurnstileTokenInfo(page);
-
-            if (info.found && info.length > 0) {
-                console.log(`[登录阶段] state=turnstile_token_ready，token length=${info.length}`);
-                return { state: 'turnstile_token_ready', length: info.length, sawProgress };
-            }
-            if (info.verificationFailed) {
-                console.log('[登录阶段] state=turnstile_verification_failed（点击后明确失败）');
-                return { state: 'turnstile_verification_failed', length: 0, sawProgress };
-            }
-
-            // 记录 token 字段实时状态（每次重新查询 DOM，不缓存旧 ElementReference）
-            // alive 仅当字段仍有 DOM 引用且 length>0 时才为有效
-            const fieldSummary = info.fields.map(f => ({ name: f.name, len: f.length }));
-            const fieldsWithValue = info.fields.filter(f => f.length > 0).length;
-
-            // frame 状态诊断
-            const currentFrames = findChallengeFrames(page);
-            const curUrl = currentFrames.length > 0 ? (currentFrames[0].url() || '') : '';
-            let detectedProgress = false;
-
-            // URL 变化 → progress
-            if (curUrl && lastFrameUrl && curUrl !== lastFrameUrl) {
-                const prevTail = lastFrameUrl.split('/').pop() || lastFrameUrl.substring(0, 30);
-                const curTail = curUrl.split('/').pop() || curUrl.substring(0, 30);
-                const prevHash = lastFrameUrl.split('').reduce((h,c)=>(((h<<5)-h)+c.charCodeAt(0))|0,0).toString(36).substring(0,6);
-                const curHash = curUrl.split('').reduce((h,c)=>(((h<<5)-h)+c.charCodeAt(0))|0,0).toString(36).substring(0,6);
-                if (!sawProgress) {
-                    console.log(`[登录阶段] challenge frame 状态已变化，验证可能正在处理中，继续等待 token。`);
-                    console.log(`[登录阶段] prevTail=${prevTail} curTail=${curTail} hash=${prevHash}→${curHash}`);
-                }
-                detectedProgress = true;
-                lastFrameUrl = curUrl;
-            }
-
-            // frame 消失 → 立即检查父页面状态
-            if (!curUrl && lastFrameUrl) {
-                if (!sawProgress) {
-                    console.log(`[登录阶段] challenge frame 已消失，检查父页面状态...`);
-                    // 父页面检查
-                    const parentCheck = await getTurnstileTokenInfo(page);
-                    if (parentCheck.found && parentCheck.length > 0) {
-                        console.log(`[登录阶段] frame 消失后，父页面 token 已就绪， length=${parentCheck.length}`);
-                        return { state: 'turnstile_token_ready', length: parentCheck.length, sawProgress: true };
-                    }
-                    if (parentCheck.verificationFailed) {
-                        console.log('[登录阶段] frame 消失后父页面检测到 Verification failed');
-                        return { state: 'turnstile_verification_failed', length: 0, sawProgress: true };
-                    }
-                    // 检查是否有新的 challenge frame 重建
-                    const newFrames = findChallengeFrames(page);
-                    if (newFrames.length > 0) {
-                        const newUrl = newFrames[0].url() || '';
-                        console.log(`[登录阶段] frame 消失后又出现新 challenge frame, url=${newUrl.substring(0, 90)}`);
-                        detectedProgress = true;
-                        lastFrameUrl = newUrl;
-                    } else {
-                        // widget DOM 状态
-                        console.log(`[登录阶段] frame 消失后父页面状态: tokenFields=${JSON.stringify(parentCheck.fields.map(f => ({ name: f.name, len: f.length })))} widgetVisible=${parentCheck.cfWidgetVisible} verificationFailed=${parentCheck.verificationFailed}`);
-                    }
-                }
-                if (!detectedProgress) {
-                    lastFrameUrl = '';
-                    detectedProgress = true;
-                }
-            }
-
-            if (detectedProgress && !sawProgress) {
-                sawProgress = true;
-                progressAt = Date.now();
-                console.log(`[登录阶段] 检测到 progress，延长等待窗口 (+${progressExtraMs}ms)`);
-            } else if (detectedProgress && sawProgress) {
-                // 同一 progress 窗口内不再反复延长（只在首次设 progressAt）
-            }
-
-            if (curUrl) lastFrameUrl = curUrl;
-
-            await page.waitForTimeout(500);
-        }
-    } finally {
-        try {
-            page.removeListener('pageerror', pageErrorHandler);
-            page.removeListener('console', errorHandler);
-        } catch (e) {}
-    }
-
-    // 终局检查
-    const finalInfo = await getTurnstileTokenInfo(page);
-    if (finalInfo.found && finalInfo.length > 0) {
-        console.log(`[登录阶段] state=turnstile_token_ready，token length=${finalInfo.length}`);
-        return { state: 'turnstile_token_ready', length: finalInfo.length, sawProgress };
-    }
-    if (finalInfo.verificationFailed) {
-        console.log('[登录阶段] state=turnstile_verification_failed');
-        return { state: 'turnstile_verification_failed', length: 0, sawProgress };
-    }
-    if (pageErrors.length > 0) {
-        console.log(`[Turnstile PageError] ${pageErrors.slice(0, 3).join(' | ')}`);
-    }
-    if (consoleErrors.length > 0) {
-        console.log(`[Turnstile Console] ${consoleErrors.slice(0, 3).join(' | ')}`);
-    }
-    console.log(`[登录阶段] 点击后等待结束。sawProgress=${sawProgress} token length=${finalInfo.length || 0}`);
-    // 不再只标 token_missing，区分有无 progress
-    const resultState = sawProgress ? 'challenge_progress_no_token' : 'click_no_effect';
-    console.log(`[登录阶段] state=${resultState}（progress=${sawProgress} token=${finalInfo.length || 0}）`);
-    return { state: resultState, length: 0, sawProgress };
-}
-
-// --- 前置观察 auto token（短观察，不是成功条件） ---
-// --- 前置观察 auto token（短观察，不是成功条件） ---
-async function waitForAutoTurnstileToken(page, timeoutMs = 5000) {
-    const startedAt = Date.now();
-    console.log(`[登录阶段] auto token 前置观察 (最长 ${timeoutMs}ms)...`);
-    while (Date.now() - startedAt < timeoutMs) {
-        const info = await getTurnstileTokenInfo(page);
-        if (info.found && info.length > 0) {
-            console.log(`[登录阶段] auto token 观察结束，token length=${info.length}`);
-            return true;
-        }
-        if (info.verificationFailed) return false;
-        await page.waitForTimeout(500);
-    }
-    const finalInfo = await getTurnstileTokenInfo(page);
-    console.log(`[登录阶段] auto token 等待结束，token length=${finalInfo.length || 0}`);
-    return !!(finalInfo.found && finalInfo.length > 0);
-}
-
-// --- 读取 token / widget 状态（严格健康判断 + 诊断） ---
-async function getTurnstileTokenInfo(page) {
-    // Playwright 侧：所有 frame URL（比 DOM iframe.src 更可靠）
-    let challengeFrameUrls = [];
-    try {
-        challengeFrameUrls = page.frames()
-            .map((f) => f.url())
-            .filter((u) => u && u !== 'about:blank' && /challenges\.cloudflare|turnstile|cloudflare\.com\/cdn-cgi/i.test(u));
-    } catch (e) { }
-
-    const domInfo = await page.evaluate(() => {
-        const selectors = [
-            'input[name="cf-turnstile-response"]',
-            'textarea[name="cf-turnstile-response"]',
-            'input[name="g-recaptcha-response"]',
-            'textarea[name="g-recaptcha-response"]',
-            '[name="cf-turnstile-response"]',
-            '[name="g-recaptcha-response"]'
-        ];
-
-        const found = [];
-        for (const selector of selectors) {
-            document.querySelectorAll(selector).forEach((el) => {
-                const value = (el.value || el.getAttribute('value') || '').trim();
-                found.push({
-                    selector,
-                    tag: el.tagName,
-                    name: el.getAttribute('name') || '',
-                    length: value.length,
-                    hasValue: value.length > 0
+            const data = await frame.evaluate(() => window.__turnstile_data).catch(() => null);
+            if (data) {
+                console.log('>> 发现 Turnstile 数据。比例:', data);
+                const iframeElement = await frame.frameElement();
+                if (!iframeElement) continue;
+                const box = await iframeElement.boundingBox();
+                if (!box) continue;
+                const clickX = box.x + (box.width * data.xRatio);
+                const clickY = box.y + (box.height * data.yRatio);
+                console.log(`>> 计算点击坐标: (${clickX.toFixed(2)}, ${clickY.toFixed(2)})`);
+                const client = await page.context().newCDPSession(page);
+                await client.send('Input.dispatchMouseEvent', {
+                    type: 'mousePressed',
+                    x: clickX,
+                    y: clickY,
+                    button: 'left',
+                    clickCount: 1
                 });
-            });
-        }
-
-        // 递归收集 iframe（含 shadowRoot）
-        const iframes = [];
-        const walk = (root) => {
-            if (!root) return;
-            try {
-                root.querySelectorAll('iframe').forEach((el) => {
-                    const rect = el.getBoundingClientRect();
-                    iframes.push({
-                        src: (el.src || el.getAttribute('src') || '').substring(0, 160),
-                        title: el.title || '',
-                        w: Math.round(rect.width || el.offsetWidth || 0),
-                        h: Math.round(rect.height || el.offsetHeight || 0)
-                    });
+                await new Promise(r => setTimeout(r, 50 + Math.random() * 100));
+                await client.send('Input.dispatchMouseEvent', {
+                    type: 'mouseReleased',
+                    x: clickX,
+                    y: clickY,
+                    button: 'left',
+                    clickCount: 1
                 });
-                root.querySelectorAll('*').forEach((el) => {
-                    if (el.shadowRoot) walk(el.shadowRoot);
-                });
-            } catch (e) { }
-        };
-        walk(document);
-
-        const widgets = Array.from(document.querySelectorAll('[data-sitekey], .cf-turnstile, #cf-turnstile, [class*="turnstile"]'));
-        const widgetInfo = widgets.map((el) => {
-            const rect = el.getBoundingClientRect();
-            return {
-                tag: el.tagName,
-                className: String(el.className || ''),
-                sitekey: el.getAttribute('data-sitekey') || '',
-                hasShadow: !!el.shadowRoot,
-                visible: !!(rect.width > 0 && rect.height > 0),
-                w: Math.round(rect.width),
-                h: Math.round(rect.height),
-                childIframes: el.querySelectorAll('iframe').length
-            };
-        });
-
-        const bodyText = (document.body && document.body.innerText) ? document.body.innerText : '';
-        const verificationFailed = /Verification failed/i.test(bodyText)
-            || (/Troubleshoot/i.test(bodyText) && /CLOUDFLARE|cloudflare/i.test(bodyText));
-
-        // Turnstile 脚本是否已加载
-        const scripts = Array.from(document.querySelectorAll('script[src]')).map((s) => s.src);
-        const turnstileScriptLoaded = scripts.some((s) => /challenges\.cloudflare\.com|turnstile/i.test(s));
-        const turnstileApi = typeof window.turnstile !== 'undefined';
-
-        const hasResponseField = found.length > 0;
-        const cfWidgetVisible = widgetInfo.some((w) =>
-            w.visible && (/cf-turnstile/i.test(w.className) || w.sitekey)
-        );
-
-        // 健康 iframe：真实尺寸 + 有效 src
-        const healthyIframe = iframes.find((f) =>
-            f.w >= 50 && f.h >= 20
-            && f.src
-            && /challenges\.cloudflare|turnstile|cloudflare/i.test(f.src + ' ' + f.title)
-        );
-
-        // 死 iframe：1x1 / 空 src 小框
-        const deadIframe = !healthyIframe && iframes.some((f) =>
-            (f.w <= 5 && f.h <= 5) || (!f.src && f.w <= 30 && f.h <= 30)
-        );
-
-        // challenge 未 hydrate：容器在、字段在，但没有健康 iframe
-        const challengeNotHydrated = cfWidgetVisible && hasResponseField && !healthyIframe && !verificationFailed;
-
-        const strictlyHealthy = !verificationFailed
-            && cfWidgetVisible
-            && hasResponseField
-            && !!healthyIframe;
-
-        const tokenHit = found.find((f) => f.hasValue);
-        return {
-            found: !!tokenHit,
-            selector: tokenHit ? tokenHit.selector : null,
-            length: tokenHit ? tokenHit.length : 0,
-            fields: found,
-            widgets: widgetInfo,
-            iframes,
-            verificationFailed,
-            hasResponseField,
-            cfWidgetVisible,
-            healthyIframe: !!healthyIframe,
-            deadIframe,
-            strictlyHealthy,
-            challengeNotHydrated,
-            turnstileScriptLoaded,
-            turnstileApi,
-            scriptCount: scripts.filter((s) => /cloudflare|turnstile/i.test(s)).length
-        };
-    }).catch(() => ({
-        found: false, selector: null, length: 0, fields: [], widgets: [], iframes: [],
-        verificationFailed: false, hasResponseField: false, cfWidgetVisible: false,
-        healthyIframe: false, deadIframe: false, strictlyHealthy: false,
-        challengeNotHydrated: false, turnstileScriptLoaded: false, turnstileApi: false, scriptCount: 0
-    }));
-
-    // 若 Playwright 看到真实 challenge frame，也算健康（即使 DOM src 为空）
-    if (challengeFrameUrls.length > 0 && !domInfo.healthyIframe) {
-        domInfo.healthyIframe = true;
-        domInfo.challengeFrameUrls = challengeFrameUrls.map((u) => u.substring(0, 120));
-        // 有真实 challenge frame + 可见 widget + 字段 → 可点击
-        if (!domInfo.verificationFailed && domInfo.cfWidgetVisible && domInfo.hasResponseField) {
-            domInfo.strictlyHealthy = true;
-            domInfo.challengeNotHydrated = false;
-            domInfo.deadIframe = false;
-        }
-    } else {
-        domInfo.challengeFrameUrls = challengeFrameUrls.map((u) => u.substring(0, 120));
-    }
-
-    return domInfo;
-}
-
-// --- 清除旧 challenge 点击数据（刷新后必须调用） ---
-async function clearStaleTurnstileData(page) {
-    try {
-        // 主 frame
-        await page.evaluate(() => {
-            try { delete window.__turnstile_data; } catch (e) {
-                try { window.__turnstile_data = undefined; } catch (e2) { }
+                console.log('>> CDP 点击已发送。');
+                await client.detach();
+                return true;
             }
-        }).catch(() => { });
-        // 所有子 frame
-        for (const frame of page.frames()) {
-            if (frame === page.mainFrame()) continue;
-            await frame.evaluate(() => {
-                try { delete window.__turnstile_data; } catch (e) {
-                    try { window.__turnstile_data = undefined; } catch (e2) { }
-                }
-            }).catch(() => { });
-        }
-        console.log('[登录阶段] 已清除旧 __turnstile_data。');
-    } catch (e) {
-        console.log(`[登录阶段] 清除旧 turnstile 数据失败: ${e.message}`);
+        } catch (e) { }
     }
+    return false;
 }
 
-// --- 检测页面是否出现 Cloudflare Verification failed ---
-async function isTurnstileVerificationFailed(page) {
-    try {
-        const text = await page.evaluate(() => (document.body && document.body.innerText) || '');
-        if (/Verification failed/i.test(text)) return true;
-        if (/Troubleshoot/i.test(text) && /CLOUDFLARE|cloudflare/i.test(text)) return true;
-        const info = await getTurnstileTokenInfo(page);
-        return !!info.verificationFailed;
-    } catch (e) {
-        return false;
-    }
-}
-
-// --- 统一状态：turnstile_token_ready | turnstile_verification_failed | turnstile_widget_not_ready | turnstile_token_missing ---
-function classifyTurnstileState(info, { afterClick = false } = {}) {
-    if (info && info.found) return 'turnstile_token_ready';
-    if (info && info.verificationFailed) return 'turnstile_verification_failed';
-    if (info && info.strictlyHealthy) {
-        return afterClick ? 'turnstile_token_missing' : 'turnstile_widget_ready';
-    }
-    if (info && (info.deadIframe || !info.cfWidgetVisible || !info.hasResponseField || !info.healthyIframe)) {
-        return 'turnstile_widget_not_ready';
-    }
-    return afterClick ? 'turnstile_token_missing' : 'turnstile_widget_not_ready';
-}
-
-// --- 刷新登录页并完整重走等待流程（清旧数据一次 → DOMContentLoaded → 初始化 → 健康检查） ---
-async function reloadLoginChallenge(page, reason = 'refresh') {
-    console.log(`[登录阶段] 刷新登录页 challenge，原因: ${reason}`);
-    await page.goto('https://dashboard.katabump.com/auth/login', {
-        waitUntil: 'domcontentloaded',
-        timeout: 60000
-    });
-    // goto 后清一次旧数据即可（不要前后各清一次）
-    await clearStaleTurnstileData(page);
-    // 等 DOM 稳定 + Turnstile 脚本初始化，不要立刻点击
-    await page.waitForTimeout(2500 + Math.random() * 1000);
-    try {
-        await page.mouse.move(120 + Math.random() * 80, 140 + Math.random() * 60, { steps: 6 });
-        await page.waitForTimeout(200);
-        await page.mouse.move(380 + Math.random() * 100, 320 + Math.random() * 80, { steps: 8 });
-        await page.waitForTimeout(300);
-    } catch (e) { }
-    await page.waitForTimeout(1500);
-    console.log('[登录阶段] 刷新完成，进入完整 widget 等待流程。');
-}
-
-// --- 等待 Turnstile widget 真正就绪（严格条件） ---
-// 返回: { state, ready, autoSolved, failed, info }
-async function waitForHealthyTurnstile(page, timeoutMs = 20000) {
-    const startedAt = Date.now();
-    console.log(`[登录阶段] 等待 Turnstile widget 就绪 (最长 ${timeoutMs}ms)...`);
-    let lastLogAt = 0;
-
-    while (Date.now() - startedAt < timeoutMs) {
-        const info = await getTurnstileTokenInfo(page);
-        const state = classifyTurnstileState(info);
-
-        if (state === 'turnstile_token_ready') {
-            console.log(`[登录阶段] state=turnstile_token_ready，token 已自动生成，长度=${info.length}`);
-            return { state, ready: true, autoSolved: true, failed: false, info };
-        }
-        if (state === 'turnstile_verification_failed') {
-            console.log('[登录阶段] state=turnstile_verification_failed（widget 已失败）。');
-            return { state, ready: false, autoSolved: false, failed: true, info };
-        }
-        if (info.strictlyHealthy) {
-            console.log(`[登录阶段] state=turnstile_widget_ready（严格健康）。challengeFrames=${JSON.stringify(info.challengeFrameUrls || [])}`);
-            return { state: 'turnstile_widget_ready', ready: true, autoSolved: false, failed: false, info };
-        }
-
-        // 诊断心跳
-        if (Date.now() - lastLogAt >= 4000) {
-            lastLogAt = Date.now();
-            console.log(
-                `[登录阶段] 等待中 state=${state}` +
-                ` cfVisible=${info.cfWidgetVisible}` +
-                ` field=${info.hasResponseField}` +
-                ` healthyIframe=${info.healthyIframe}` +
-                ` dead=${info.deadIframe}` +
-                ` notHydrated=${!!info.challengeNotHydrated}` +
-                ` script=${!!info.turnstileScriptLoaded}` +
-                ` api=${!!info.turnstileApi}` +
-                ` frames=${JSON.stringify(info.challengeFrameUrls || [])}` +
-                ` iframes=${JSON.stringify(info.iframes)}`
-            );
-        }
-        await page.waitForTimeout(1000);
-    }
-
-    const finalInfo = await getTurnstileTokenInfo(page);
-    const state = classifyTurnstileState(finalInfo);
-    console.log(
-        `[登录阶段] widget 等待超时。state=${state}` +
-        ` healthy=${finalInfo.healthyIframe} dead=${finalInfo.deadIframe}` +
-        ` notHydrated=${!!finalInfo.challengeNotHydrated}` +
-        ` script=${!!finalInfo.turnstileScriptLoaded} api=${!!finalInfo.turnstileApi}` +
-        ` challengeFrames=${JSON.stringify(finalInfo.challengeFrameUrls || [])}` +
-        ` iframes=${JSON.stringify(finalInfo.iframes)}` +
-        ` widgets=${JSON.stringify(finalInfo.widgets)}`
-    );
-    return {
-        state,
-        ready: false,
-        autoSolved: false,
-        failed: state === 'turnstile_verification_failed',
-        info: finalInfo
-    };
-}
-
-// --- 通用过盾循环（保留原逻辑，供 Renew 等阶段使用） ---
+// --- 通用过盾循环（保留原逻辑） ---
 async function solveTurnstileIfPresent(page, stageName = "通用", maxAttempts = 10, waitAfterClick = 5000) {
     console.log(`[${stageName}] 开始检测 Cloudflare Turnstile...`);
     for (let i = 0; i < maxAttempts; i++) {
-        const clickResult = await attemptTurnstileCdp(page);
-        const clicked = !!(clickResult && (clickResult.sent === true || clickResult === true));
+        const clicked = await attemptTurnstileCdp(page);
         if (clicked) {
             console.log(`[${stageName}] ✅ 成功点击 Turnstile，等待验证通过 (${waitAfterClick}ms)...`);
             await page.waitForTimeout(waitAfterClick);
@@ -805,133 +246,6 @@ async function solveTurnstileIfPresent(page, stageName = "通用", maxAttempts =
         if (i < maxAttempts - 1) await page.waitForTimeout(1000);
     }
     console.log(`[${stageName}] 未检测到 Turnstile 或无需点击。`);
-    return false;
-}
-
-// --- 登录专用：减法状态机 + 结果细分 ---
-// 一轮 = 等就绪 → 单次点击 → 充分等待 → 成功/失败/超时刷新
-// state 输出：
-//   turnstile_token_ready
-//   turnstile_verification_failed
-//   turnstile_widget_not_ready
-//   turnstile_click_target_missing
-//   click_no_effect            // 点击发出但 frame/URL 无变化，token=0
-//   challenge_progress_no_token // 点击后 frame 有变化/消失，但最终 token=0
-async function solveLoginTurnstile(page, totalTimeoutMs = 180000) {
-    const maxAttempts = 3;
-    let attempt = 0;
-    let lastState = 'turnstile_widget_not_ready';
-    const overallStart = Date.now();
-    console.log(`[登录阶段] 开始解决 Turnstile（一轮一次点击 + 充分等待，最多 ${maxAttempts} 次完整尝试）...`);
-
-    while (attempt < maxAttempts) {
-        if (Date.now() - overallStart > totalTimeoutMs) {
-            console.log('[登录阶段] 全局时间耗尽。');
-            break;
-        }
-        attempt++;
-        console.log(`\n[登录阶段] ===== 完整尝试 ${attempt}/${maxAttempts} =====`);
-
-        const health = await waitForHealthyTurnstile(page, 20000);
-        lastState = health.state || lastState;
-        const info = health.info || {};
-
-        if (health.autoSolved || health.state === 'turnstile_token_ready') {
-            console.log('[登录阶段] state=turnstile_token_ready（自动）');
-            return { ok: true, state: 'turnstile_token_ready', message: 'Turnstile token ready' };
-        }
-
-        if (health.failed || health.state === 'turnstile_verification_failed') {
-            lastState = 'turnstile_verification_failed';
-            if (attempt >= maxAttempts) {
-                return { ok: false, state: 'turnstile_verification_failed', message: `Cloudflare Verification failed after ${maxAttempts} full attempts` };
-            }
-            console.log(`[登录阶段] Verification failed → 刷新进入下一完整尝试`);
-            try { await reloadLoginChallenge(page, 'verification_failed'); } catch (e) {}
-            continue;
-        }
-
-        if (!health.ready) {
-            lastState = 'turnstile_widget_not_ready';
-            if (attempt >= maxAttempts) {
-                return { ok: false, state: 'turnstile_widget_not_ready', message: info.challengeNotHydrated ? 'Turnstile challenge iframe never hydrated after full attempts' : `Turnstile widget not ready after ${maxAttempts} full attempts` };
-            }
-            console.log(`[登录阶段] widget 未就绪 → 刷新进入下一完整尝试`);
-            try { await reloadLoginChallenge(page, 'widget_not_ready'); } catch (e) {}
-            continue;
-        }
-
-        console.log('[登录阶段] state=turnstile_widget_ready');
-
-        const autoOk = await waitForAutoTurnstileToken(page, 5000);
-        if (autoOk) {
-            return { ok: true, state: 'turnstile_token_ready', message: 'Turnstile token ready (auto)' };
-        }
-
-        const clickResult = await attemptTurnstileSingleClick(page);
-        if (!clickResult.sent) {
-            lastState = 'turnstile_click_target_missing';
-            if (attempt >= maxAttempts) {
-                return { ok: false, state: 'turnstile_click_target_missing', message: `Could not send single checkbox click after ${maxAttempts} full attempts` };
-            }
-            console.log('[登录阶段] 点击未发出 → 刷新进入下一完整尝试');
-            try { await reloadLoginChallenge(page, 'click_target_missing'); } catch (e) {}
-            continue;
-        }
-
-        console.log('[登录阶段] state=click_sent，停止本轮其他点击，只等待处理结果。');
-        const after = await waitAfterTurnstileClick(page, clickResult.urlBefore, 15000, 12000);
-
-        if (after.state === 'turnstile_token_ready') {
-            return { ok: true, state: 'turnstile_token_ready', message: `Turnstile token ready (length=${after.length})` };
-        }
-        if (after.state === 'turnstile_verification_failed') {
-            lastState = 'turnstile_verification_failed';
-            if (attempt >= maxAttempts) {
-                return { ok: false, state: 'turnstile_verification_failed', message: 'Verification failed after click' };
-            }
-            console.log('[登录阶段] 点击后 Verification failed → 刷新进入下一完整尝试');
-            try { await reloadLoginChallenge(page, 'verification_failed_after_click'); } catch (e) {}
-            continue;
-        }
-
-        // click_no_effect 或 challenge_progress_no_token
-        lastState = after.state;
-        if (attempt >= maxAttempts) {
-            return { ok: false, state: lastState, message: `after.click sent, state=${after.state}, sawProgress=${after.sawProgress}` };
-        }
-        console.log(`[登录阶段] click sent → state=${after.state} (sawProgress=${after.sawProgress}) → 刷新进入下一完整尝试`);
-        try { await reloadLoginChallenge(page, after.state); } catch (e) {}
-    }
-
-    const finalInfo = await getTurnstileTokenInfo(page);
-    if (finalInfo.found && finalInfo.length > 0) {
-        return { ok: true, state: 'turnstile_token_ready', message: 'Turnstile token ready' };
-    }
-    console.log(`[登录阶段] 结束。state=${lastState} token length=${finalInfo.length || 0}`);
-    return { ok: false, state: lastState || 'turnstile_token_missing', message: `Turnstile finished without token (state=${lastState})` };
-}
-
-// --- 等待 Turnstile token 真正生成（点击成功 ≠ token 有效） ---
-async function waitForTurnstileToken(page, timeoutMs = 30000) {
-    const startedAt = Date.now();
-    console.log(`[登录阶段] 等待 Turnstile token 生成 (最长 ${timeoutMs}ms)...`);
-
-    while (Date.now() - startedAt < timeoutMs) {
-        const tokenInfo = await getTurnstileTokenInfo(page);
-
-        if (tokenInfo.found) {
-            console.log(
-                `[登录阶段] Turnstile token 已生成，字段=${tokenInfo.selector}，长度=${tokenInfo.length}`
-            );
-            return true;
-        }
-
-        await page.waitForTimeout(1000);
-    }
-
-    const finalInfo = await getTurnstileTokenInfo(page);
-    console.log(`[登录阶段] Turnstile token 等待超时，未提交登录表单。fields=${JSON.stringify(finalInfo.fields)} iframes=${JSON.stringify(finalInfo.iframes)}`);
     return false;
 }
 
@@ -1126,8 +440,7 @@ async function readExpiryDate(page) {
 // ============================================================
 async function tryClickCaptchaCheckbox(page, modal) {
     // 策略1: 利用 INJECTED_SCRIPT 注入的 __turnstile_data + CDP 点击
-    const cdpRes = await attemptTurnstileCdp(page);
-    const clickedCdp = !!(cdpRes && (cdpRes.sent === true || cdpRes === true));
+    const clickedCdp = await attemptTurnstileCdp(page);
     if (clickedCdp) {
         console.log('[Captcha] CDP 点击成功，等待验证...');
         await page.waitForTimeout(3000);
@@ -1248,39 +561,9 @@ async function ensureScreenshotsDir() {
             console.log('访问登录页面...');
             await page.goto('https://dashboard.katabump.com/auth/login', { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-            // 登录页 Turnstile 严格状态机：
-            // widget 健康 → 点击 → 等 token → token 有值才提交
-            // Verification failed → 不点 → 清旧数据 → 刷新 → 完整等待 → 最多 3 次
-            // --disable-blink-features 只是环境差异项，不是过盾保证
+            // 登录页 Turnstile
             await page.waitForTimeout(3000);
-
-            // 先做一次轻微人工鼠标活动
-            try {
-                await page.mouse.move(100, 100, { steps: 5 });
-                await page.waitForTimeout(300);
-                await page.mouse.move(400, 300, { steps: 8 });
-                await page.waitForTimeout(200);
-            } catch (e) { }
-
-            // 3 轮完整尝试（就绪+单次点击+15s等待），全局 180s
-            const turnstileResult = await solveLoginTurnstile(page, 180000);
-            if (!turnstileResult.ok) {
-                const state = turnstileResult.state || 'turnstile_token_missing';
-                console.error(`   >> ⚠️ Turnstile 未通过。state=${state} message=${turnstileResult.message}`);
-                runStatus = 'captcha_required';
-                blockMessage = turnstileResult.message || state;
-                renewSuccess = false;
-                const snapName = state === 'turnstile_verification_failed'
-                    ? `login_turnstile_verification_failed_${user.username.replace(/[^a-z0-9]/gi, '_')}`
-                    : state === 'turnstile_widget_not_ready'
-                        ? `login_turnstile_widget_not_ready_${user.username.replace(/[^a-z0-9]/gi, '_')}`
-                        : state === 'turnstile_click_target_missing'
-                            ? `login_turnstile_click_target_missing_${user.username.replace(/[^a-z0-9]/gi, '_')}`
-                            : `login_turnstile_token_missing_${user.username.replace(/[^a-z0-9]/gi, '_')}`;
-                await dumpDebugSnapshot(page, snapName);
-                continue;
-            }
-            console.log(`[登录阶段] state=${turnstileResult.state}，可以填写凭据并提交。`);
+            await solveTurnstileIfPresent(page, "登录阶段", 10, 5000);
 
             console.log('正在输入凭据...');
             try {
@@ -1292,39 +575,7 @@ async function ensureScreenshotsDir() {
                 await pwdInput.fill(user.password);
 
                 await page.waitForTimeout(500);
-
-                // 提交前再确认 token 仍在（防止 fill 过程中失效）
-                const tokenStillValid = await getTurnstileTokenInfo(page);
-
-                if (!tokenStillValid.found) {
-                    console.error('   >> ⚠️ 提交前 Turnstile token 已丢失，不提交登录表单。');
-                    runStatus = 'captcha_required';
-                    blockMessage = 'Turnstile token disappeared before login submit';
-                    renewSuccess = false;
-                    await dumpDebugSnapshot(
-                        page,
-                        `login_turnstile_token_lost_${user.username.replace(/[^a-z0-9]/gi, '_')}`
-                    );
-                    continue;
-                }
-                console.log(`[登录阶段] 提交前 token 仍有效，字段=${tokenStillValid.selector}，长度=${tokenStillValid.length}，提交 Login...`);
-
                 await page.getByRole('button', { name: 'Login', exact: true }).click();
-
-                // 登录后诊断：保存截图 + HTML，输出 URL / 标题 / body 片段
-                await page.waitForTimeout(2000);
-                const photoDir = await ensureScreenshotsDir();
-                await page.screenshot({ path: path.join(photoDir, `login_after_submit_${user.username.replace(/[^a-z0-9]/gi, '_')}.png`), fullPage: true });
-                try {
-                    const html = await page.content();
-                    fs.writeFileSync(path.join(photoDir, `login_after_submit_${user.username.replace(/[^a-z0-9]/gi, '_')}.html`), html, 'utf-8');
-                } catch (e) { }
-                const loginUrl = page.url();
-                const loginTitle = await page.title();
-                const loginBody = await getPageText(page);
-                console.log(`[登录诊断] 当前 URL: ${loginUrl}`);
-                console.log(`[登录诊断] 页面标题: ${loginTitle}`);
-                console.log(`[登录诊断] body 前500字符: ${loginBody.substring(0, 500)}`);
 
                 // 检查登录错误
                 try {
@@ -1339,125 +590,23 @@ async function ensureScreenshotsDir() {
                     }
                 } catch (e) { }
 
-                // 检查验证码是否被服务端接受（error=captcha / Please complete captcha）
-                {
-                    const captchaUrlHit = /error=captcha/i.test(loginUrl);
-                    const captchaTextHit = /Please complete captcha/i.test(loginBody)
-                        || /captcha required/i.test(loginBody)
-                        || /complete captcha/i.test(loginBody);
-                    if (captchaUrlHit || captchaTextHit) {
-                        console.error(`   >> ⚠️ 登录验证码未被服务端接受 (URL: ${loginUrl})`);
-                        runStatus = 'captcha_required';
-                        blockMessage = 'Login captcha was not accepted';
-                        renewSuccess = false;
-                        const photoDir2 = await ensureScreenshotsDir();
-                        await page.screenshot({ path: path.join(photoDir2, `login_captcha_required_${user.username.replace(/[^a-z0-9]/gi, '_')}.png`), fullPage: true });
-                        try {
-                            const html2 = await page.content();
-                            fs.writeFileSync(path.join(photoDir2, `login_captcha_required_${user.username.replace(/[^a-z0-9]/gi, '_')}.html`), html2, 'utf-8');
-                        } catch (e) { }
-                        continue;
-                    }
-                }
-
             } catch (e) {
                 console.log('登录操作遇到异常 (可能是已登录或超时):', e.message);
             }
 
-            // 2. 登录后进入 dashboard（多策略 fallback）
-            // 再次确认当前 URL 不含 error=captcha（防止 try 块外漏检）
-            if (/error=captcha/i.test(page.url())) {
-                console.error(`   >> ⚠️ 登录验证码未被服务端接受 (URL: ${page.url()})`);
-                runStatus = 'captcha_required';
-                blockMessage = 'Login captcha was not accepted';
-                renewSuccess = false;
-                const photoDir = await ensureScreenshotsDir();
-                await page.screenshot({ path: path.join(photoDir, `login_captcha_required_${user.username.replace(/[^a-z0-9]/gi, '_')}.png`), fullPage: true });
-                try {
-                    const html = await page.content();
-                    fs.writeFileSync(path.join(photoDir, `login_captcha_required_${user.username.replace(/[^a-z0-9]/gi, '_')}.html`), html, 'utf-8');
-                } catch (e) { }
-                continue;
-            }
-
-            console.log('正在寻找 dashboard / server 入口...');
-
-            let dashboardReady = false;
-
-            // 策略 1: URL 已包含 dashboard（排除仍在 /auth/login 的情况）
+            // 2. 登录后进入 dashboard
+            console.log('正在寻找 "See" 链接...');
             try {
-                await page.waitForURL(url => /dashboard/i.test(url) && !/auth\/login/i.test(url), { timeout: 5000 });
-                console.log('[登录] URL 已跳转到 dashboard。');
-                dashboardReady = true;
-            } catch (e) { }
-
-            // 策略 2: 页面文本包含 dashboard / server identifier / 服务器列表
-            if (!dashboardReady) {
-                const bodyText = await getPageText(page);
-                if (/dashboard/i.test(bodyText) && /server/i.test(bodyText) && !/Please complete captcha/i.test(bodyText)) {
-                    console.log('[登录] 页面文本检测到 dashboard + server，判定登录成功。');
-                    dashboardReady = true;
-                }
-            }
-
-            // 策略 3: 查找 "See" 按钮
-            if (!dashboardReady) {
-                try {
-                    const seeBtn = page.getByRole('link', { name: 'See' }).first();
-                    await seeBtn.waitFor({ timeout: 5000 });
-                    console.log('[登录] 找到 "See" 按钮。');
-                    dashboardReady = true;
-                } catch (e) { }
-            }
-
-            // 策略 4: 查找 "Access server" / "View" 按钮
-            if (!dashboardReady) {
-                const altBtns = ['Access server', 'View', 'Manage', 'Servers', 'My Servers'];
-                for (const btnName of altBtns) {
-                    try {
-                        const btn = page.getByRole('link', { name: btnName }).first();
-                        await btn.waitFor({ timeout: 2000 });
-                        console.log(`[登录] 找到 "${btnName}" 按钮。`);
-                        dashboardReady = true;
-                        break;
-                    } catch (e) { }
-                }
-            }
-
-            if (!dashboardReady) {
-                // 最后再检查一次 captcha 错误，避免误标为 login_failed
-                const finalUrl = page.url();
-                const finalBody = await getPageText(page);
-                if (/error=captcha/i.test(finalUrl) || /Please complete captcha/i.test(finalBody) || /complete captcha/i.test(finalBody)) {
-                    console.error(`   >> ⚠️ 登录验证码未被服务端接受 (URL: ${finalUrl})`);
-                    runStatus = 'captcha_required';
-                    blockMessage = 'Login captcha was not accepted';
-                    renewSuccess = false;
-                    const photoDir = await ensureScreenshotsDir();
-                    await page.screenshot({ path: path.join(photoDir, `login_captcha_required_${user.username.replace(/[^a-z0-9]/gi, '_')}.png`), fullPage: true });
-                    try {
-                        const html = await page.content();
-                        fs.writeFileSync(path.join(photoDir, `login_captcha_required_${user.username.replace(/[^a-z0-9]/gi, '_')}.html`), html, 'utf-8');
-                    } catch (e) { }
-                    continue;
-                }
-
-                console.log('login_failed: 未找到 dashboard 入口 (See / Access server / View / dashboard URL)。');
+                await page.getByRole('link', { name: 'See' }).first().waitFor({ timeout: 15000 });
+                await page.waitForTimeout(1000);
+                await page.getByRole('link', { name: 'See' }).first().click();
+            } catch (e) {
+                console.log('未找到 "See" 按钮 (可能登录未成功或界面变动)。');
                 runStatus = 'login_failed';
-                blockMessage = 'Dashboard entry not found after login';
                 const photoDir = await ensureScreenshotsDir();
-                await page.screenshot({ path: path.join(photoDir, `login_failed_no_dashboard_${user.username.replace(/[^a-z0-9]/gi, '_')}.png`), fullPage: true });
+                await page.screenshot({ path: path.join(photoDir, `see_btn_not_found_${user.username.replace(/[^a-z0-9]/gi, '_')}.png`), fullPage: true });
                 continue;
             }
-
-            // 如果有 See 按钮，点击它；否则认为已在 dashboard 页面
-            try {
-                const seeBtn = page.getByRole('link', { name: 'See' }).first();
-                if (await seeBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
-                    await seeBtn.click();
-                    console.log('[登录] 已点击 See 按钮。');
-                }
-            } catch (e) { }
 
             // 3. Renew 主循环
             for (let attempt = 1; attempt <= 20; attempt++) {
@@ -1494,21 +643,10 @@ async function ensureScreenshotsDir() {
                 const modalText = await getLocatorText(modal);
                 console.log(`[Modal] 弹窗文本预览: ${modalText.substring(0, 200)}`);
 
-                // 识别弹窗验证类型：ALTCHA / CF Turnstile / 无，非 CF 时跳过
-                // 只用强特征，限定当前弹窗
-                const hasCfInModal = await modal.locator('.cf-turnstile, iframe[src*="challenges.cloudflare.com"]').count().catch(() => 0) > 0;
-                const hasAltchaInModal2 = /Protected by ALTCHA/i.test(modalText)
-                    || await modal.locator('altcha-widget, [data-altcha], .altcha').count().catch(() => 0) > 0;
-                console.log(`[Renew阶段] 弹窗验证类型: ${hasAltchaInModal2 ? 'ALTCHA' : hasCfInModal ? 'CF Turnstile' : '无'}`);
+                // 【保留】解决弹窗内 Turnstile（Cloudflare 专用，ALTCHA 另处理）
+                const turnstileResult = await solveTurnstileIfPresent(page, "Renew阶段", 30, 8000);
+                console.log(`[Renew阶段] Turnstile 检测结果: ${turnstileResult ? '已处理' : '未检测到或无需点击'}`);
 
-                if (hasCfInModal && !hasAltchaInModal2) {
-                    const turnstileResult = await solveTurnstileIfPresent(page, "Renew阶段", 15, 6000);
-                    console.log(`[Renew阶段] Turnstile 检测结果: ${turnstileResult ? '已处理' : '未检测到或无需点击'}`);
-                } else if (hasAltchaInModal2) {
-                    console.log('[Renew阶段] ALTCHA 验证，由下方 ALTCHA 逻辑处理，跳过 CF Turnstile 检测。');
-                } else {
-                    console.log('[Renew阶段] 未检测到验证码类型，跳过。');
-                }
                 // 点击确认 Renew 前，读取旧 Expiry
                 const oldExpiry = await readExpiryDate(page);
                 console.log(`[Expiry] 续期前 Expiry: ${oldExpiry || '未读取到'}`);
@@ -1536,7 +674,7 @@ async function ensureScreenshotsDir() {
 
                 // 【ALTCHA 前置检测】modal text 含 ALTCHA 关键词时，必须先完成 checkbox 才能点 confirm
                 const hasAltchaInModal = /Protected by ALTCHA/i.test(modalText)
-                    || await modal.locator('altcha-widget, [data-altcha], .altcha').count().catch(() => 0) > 0;
+                    || /I'm not a robot/i.test(modalText);
                 if (hasAltchaInModal) {
                     console.log('[ALTCHA] Modal 检测到 ALTCHA/checkbox 验证，先完成验证再点 confirm。');
                     const cbCheckedBefore = await isAltchaCheckboxChecked(page, modal);
