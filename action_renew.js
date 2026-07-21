@@ -224,8 +224,11 @@ async function attemptTurnstileCdp(page) {
                     button: 'left',
                     clickCount: 1
                 });
+
                 console.log('>> CDP 点击已发送。');
                 await client.detach();
+                console.log('[Turnstile] 点击完成，硬性等待 5 秒生成 Token...');
+                await new Promise(resolve => setTimeout(resolve, 5000)); 
                 return true;
             }
         } catch (e) { }
@@ -243,7 +246,7 @@ async function solveTurnstileIfPresent(page, stageName = "通用", maxAttempts =
             await page.waitForTimeout(waitAfterClick);
             return true;
         }
-        if (i < maxAttempts - 1) await page.waitForTimeout(1000);
+        if (i < maxAttempts - 1) await page.waitForTimeout(5000);
     }
     console.log(`[${stageName}] 未检测到 Turnstile 或无需点击。`);
     return false;
@@ -577,6 +580,21 @@ async function ensureScreenshotsDir() {
                 await page.waitForTimeout(500);
                 await page.getByRole('button', { name: 'Login', exact: true }).click();
 
+                // 登录后诊断：保存截图 + HTML，输出 URL / 标题 / body 片段
+                await page.waitForTimeout(2000);
+                const photoDir = await ensureScreenshotsDir();
+                await page.screenshot({ path: path.join(photoDir, `login_after_submit_${user.username.replace(/[^a-z0-9]/gi, '_')}.png`), fullPage: true });
+                try {
+                    const html = await page.content();
+                    fs.writeFileSync(path.join(photoDir, `login_after_submit_${user.username.replace(/[^a-z0-9]/gi, '_')}.html`), html, 'utf-8');
+                } catch (e) { }
+                const loginUrl = page.url();
+                const loginTitle = await page.title();
+                const loginBody = await getPageText(page);
+                console.log(`[登录诊断] 当前 URL: ${loginUrl}`);
+                console.log(`[登录诊断] 页面标题: ${loginTitle}`);
+                console.log(`[登录诊断] body 前500字符: ${loginBody.substring(0, 500)}`);
+
                 // 检查登录错误
                 try {
                     const errorMsg = page.getByText('Incorrect password or no account');
@@ -594,19 +612,67 @@ async function ensureScreenshotsDir() {
                 console.log('登录操作遇到异常 (可能是已登录或超时):', e.message);
             }
 
-            // 2. 登录后进入 dashboard
-            console.log('正在寻找 "See" 链接...');
+            // 2. 登录后进入 dashboard（多策略 fallback）
+            console.log('正在寻找 dashboard / server 入口...');
+
+            let dashboardReady = false;
+
+            // 策略 1: URL 已包含 dashboard
             try {
-                await page.getByRole('link', { name: 'See' }).first().waitFor({ timeout: 15000 });
-                await page.waitForTimeout(1000);
-                await page.getByRole('link', { name: 'See' }).first().click();
-            } catch (e) {
-                console.log('未找到 "See" 按钮 (可能登录未成功或界面变动)。');
+                await page.waitForURL(url => url.includes('dashboard'), { timeout: 5000 });
+                console.log('[登录] URL 已跳转到 dashboard。');
+                dashboardReady = true;
+            } catch (e) { }
+
+            // 策略 2: 页面文本包含 dashboard / server identifier / 服务器列表
+            if (!dashboardReady) {
+                const bodyText = await getPageText(page);
+                if (/dashboard/i.test(bodyText) && /server/i.test(bodyText)) {
+                    console.log('[登录] 页面文本检测到 dashboard + server，判定登录成功。');
+                    dashboardReady = true;
+                }
+            }
+
+            // 策略 3: 查找 "See" 按钮
+            if (!dashboardReady) {
+                try {
+                    const seeBtn = page.getByRole('link', { name: 'See' }).first();
+                    await seeBtn.waitFor({ timeout: 5000 });
+                    console.log('[登录] 找到 "See" 按钮。');
+                    dashboardReady = true;
+                } catch (e) { }
+            }
+
+            // 策略 4: 查找 "Access server" / "View" 按钮
+            if (!dashboardReady) {
+                const altBtns = ['Access server', 'View', 'Manage', 'Servers', 'My Servers'];
+                for (const btnName of altBtns) {
+                    try {
+                        const btn = page.getByRole('link', { name: btnName }).first();
+                        await btn.waitFor({ timeout: 2000 });
+                        console.log(`[登录] 找到 "${btnName}" 按钮。`);
+                        dashboardReady = true;
+                        break;
+                    } catch (e) { }
+                }
+            }
+
+            if (!dashboardReady) {
+                console.log('login_failed: 未找到 dashboard 入口 (See / Access server / View / dashboard URL)。');
                 runStatus = 'login_failed';
                 const photoDir = await ensureScreenshotsDir();
-                await page.screenshot({ path: path.join(photoDir, `see_btn_not_found_${user.username.replace(/[^a-z0-9]/gi, '_')}.png`), fullPage: true });
+                await page.screenshot({ path: path.join(photoDir, `login_failed_no_dashboard_${user.username.replace(/[^a-z0-9]/gi, '_')}.png`), fullPage: true });
                 continue;
             }
+
+            // 如果有 See 按钮，点击它；否则认为已在 dashboard 页面
+            try {
+                const seeBtn = page.getByRole('link', { name: 'See' }).first();
+                if (await seeBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+                    await seeBtn.click();
+                    console.log('[登录] 已点击 See 按钮。');
+                }
+            } catch (e) { }
 
             // 3. Renew 主循环
             for (let attempt = 1; attempt <= 20; attempt++) {
